@@ -26,14 +26,16 @@ public class XsdImporter {
     private final Map<String, StructureDefinition> xsdTypeMap;
     private final Map<String, String> namespaces;
     private final String modelName;
+    private final XsdImportOptions options;
 
-    public static Iterable<StructureDefinition> fromSchema(XmlSchema schema, String modelName, List<StructureDefinition> fhirTypes) {
-        XsdImporter importer = new XsdImporter(schema, modelName, fhirTypes);
+    public static Iterable<StructureDefinition> fromSchema(XmlSchema schema, String modelName, List<StructureDefinition> fhirTypes, XsdImportOptions options) {
+        XsdImporter importer = new XsdImporter(schema, modelName, fhirTypes, options);
         return importer.definitions.values();
     }
 
-    public XsdImporter(XmlSchema schema, String modelName, List<StructureDefinition> fhirTypes) {
+    public XsdImporter(XmlSchema schema, String modelName, List<StructureDefinition> fhirTypes, XsdImportOptions options) {
         this.schema = schema;
+        this.options = options;
         this.fhirDefinitions = new HashMap<>();
         for (StructureDefinition sd : fhirTypes) {
             fhirDefinitions.put(sd.getName(), sd);
@@ -198,16 +200,24 @@ public class XsdImporter {
         StructureDefinition definition = definitions.get(qualifiedTypeName);
         if (definition == null) {
 
+            // resolve the base
+            StructureDefinition baseDefinition = null;
+            if (schemaSimpleType.getContent() instanceof XmlSchemaSimpleTypeRestriction) {
+                baseDefinition = resolveDefinition(((XmlSchemaSimpleTypeRestriction)schemaSimpleType.getContent()).getBaseTypeName());
+                if (baseDefinition != null) {
+                    if (!options.getGenerateSimpleTypeExtensions()) {
+                        definitions.put(qualifiedTypeName, definition);
+                        return definition;
+                    }
+                }
+            }
+
             // create the basic definition
             definition = createStructureDefinition(schemaSimpleType);
             definitions.put(qualifiedTypeName, definition);
 
-            // resolve the base
-            if (schemaSimpleType.getContent() instanceof XmlSchemaSimpleTypeRestriction) {
-                StructureDefinition baseDefinition = resolveDefinition(((XmlSchemaSimpleTypeRestriction)schemaSimpleType.getContent()).getBaseTypeName());
-                if (baseDefinition != null) {
-                    definition.setBase(baseDefinition.getUrl());
-                }
+            if (baseDefinition != null) {
+                definition.setBase(baseDefinition.getUrl());
             }
 
             // set the kind to logical, DataTypes cannot be defined in a logical model
@@ -260,6 +270,9 @@ public class XsdImporter {
             String rootPath = unqualifiedTypeName;
             rootElement.setPath(rootPath);
             rootElement.setShort(unqualifiedTypeName);
+            MarkdownDt md = new MarkdownDt();
+            md.setValue(definition.getDescription());
+            rootElement.setDefinition(md);
             rootElement.setMin(0);
             rootElement.setMax("*");
 
