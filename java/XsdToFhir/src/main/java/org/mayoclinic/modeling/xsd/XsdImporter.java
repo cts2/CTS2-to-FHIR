@@ -8,7 +8,6 @@ import ca.uhn.fhir.model.dstu2.valueset.StructureDefinitionKindEnum;
 import ca.uhn.fhir.model.primitive.DateTimeDt;
 import ca.uhn.fhir.model.primitive.MarkdownDt;
 import org.apache.ws.commons.schema.*;
-import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
 import javax.xml.namespace.QName;
@@ -27,6 +26,7 @@ public class XsdImporter {
     private final Map<String, String> namespaces;
     private final String modelName;
     private final XsdImportOptions options;
+    private final String fhirVersion;
 
     public static Iterable<StructureDefinition> fromSchema(XmlSchema schema, String modelName, List<StructureDefinition> fhirTypes, XsdImportOptions options) {
         XsdImporter importer = new XsdImporter(schema, modelName, fhirTypes, options);
@@ -34,13 +34,18 @@ public class XsdImporter {
     }
 
     public XsdImporter(XmlSchema schema, String modelName, List<StructureDefinition> fhirTypes, XsdImportOptions options) {
+        String fhirVersion = "1.3.0"; // Default to 1.3.0 (current trunk version)
         this.schema = schema;
         this.options = options;
         this.fhirDefinitions = new HashMap<>();
         for (StructureDefinition sd : fhirTypes) {
             fhirDefinitions.put(sd.getName(), sd);
+            if (fhirVersion == null) {
+                fhirVersion = sd.getFhirVersion();
+            }
         }
 
+        this.fhirVersion = fhirVersion;
         this.xsdTypeMap = new HashMap<>();
         loadXsdTypeMap();
 
@@ -174,16 +179,14 @@ public class XsdImporter {
         definition.setName(unqualify(qualifiedTypeName));
         definition.setDisplay(qualifiedTypeName);
         definition.setStatus(ConformanceResourceStatusEnum.DRAFT);
-        definition.setPublisher("TODO: Publisher");
-        definition.addContact().setName("TODO: Contact").addTelecom().setSystem(ContactPointSystemEnum.URL).setValue("http://hl7.org/fhir");
+        definition.setPublisher(options.getPublisher());
+        definition.addContact().setName(options.getPublisherContact()).addTelecom().setSystem(ContactPointSystemEnum.URL).setValue(options.getPublisherUrl());
         definition.setDate(DateTimeDt.withCurrentTime());
         definition.setAbstract(false);
 
         // Get the documentation annotation
         definition.setDescription(getDocumentation(schemaType.getAnnotation()));
-
-        // TODO: Set FhirVersion?
-        //definition.setFhirVersion();
+        definition.setFhirVersion(fhirVersion);
 
         // TODO: Mappings?
 
@@ -205,9 +208,8 @@ public class XsdImporter {
             if (schemaSimpleType.getContent() instanceof XmlSchemaSimpleTypeRestriction) {
                 baseDefinition = resolveDefinition(((XmlSchemaSimpleTypeRestriction)schemaSimpleType.getContent()).getBaseTypeName());
                 if (baseDefinition != null) {
-                    if (!options.getGenerateSimpleTypeExtensions()) {
-                        definitions.put(qualifiedTypeName, definition);
-                        return definition;
+                    if (!options.getGenerateSimpleTypeRestrictions()) {
+                        return baseDefinition;
                     }
                 }
             }
@@ -223,7 +225,7 @@ public class XsdImporter {
             // set the kind to logical, DataTypes cannot be defined in a logical model
             definition.setKind(StructureDefinitionKindEnum.LOGICAL_MODEL);
 
-            // add elements?
+            // add elements
             StructureDefinition.Snapshot snapshot = new StructureDefinition.Snapshot();
             definition.setSnapshot(snapshot);
             ElementDefinitionDt rootElement = snapshot.addElement();
@@ -232,6 +234,10 @@ public class XsdImporter {
             rootElement.setShort(unqualifiedTypeName);
             rootElement.setMin(0);
             rootElement.setMax("*");
+            if (baseDefinition != null) {
+                rootElement.addType().setCode(baseDefinition.getName());
+                rootElement.setBase(new ElementDefinitionDt.Base().setPath(baseDefinition.getUrl()).setMin(0).setMax("*"));
+            }
 
             // TODO: Enumerations...
             // TODO: Mapping to base FHIR types...
@@ -249,15 +255,18 @@ public class XsdImporter {
         String unqualifiedTypeName = unqualify(qualifiedTypeName);
         StructureDefinition definition = definitions.get(qualifiedTypeName);
         if (definition == null) {
-            definition = createStructureDefinition(schemaComplexType);
-            definitions.put(qualifiedTypeName, definition);
+            StructureDefinition baseDefinition = null;
 
             // resolve the base
             if (schemaComplexType.getBaseSchemaTypeName() != null) {
-                StructureDefinition baseDefinition = resolveDefinition(schemaComplexType.getBaseSchemaTypeName());
-                if (baseDefinition != null) {
-                    definition.setBase(baseDefinition.getUrl());
-                }
+                baseDefinition = resolveDefinition(schemaComplexType.getBaseSchemaTypeName());
+            }
+
+            definition = createStructureDefinition(schemaComplexType);
+            definitions.put(qualifiedTypeName, definition);
+
+            if (baseDefinition != null) {
+                definition.setBase(baseDefinition.getUrl());
             }
 
             // set the kind
@@ -270,11 +279,13 @@ public class XsdImporter {
             String rootPath = unqualifiedTypeName;
             rootElement.setPath(rootPath);
             rootElement.setShort(unqualifiedTypeName);
-            MarkdownDt md = new MarkdownDt();
-            md.setValue(definition.getDescription());
-            rootElement.setDefinition(md);
+            rootElement.setDefinition(buildMarkdown(definition.getDescription()));
             rootElement.setMin(0);
             rootElement.setMax("*");
+            if (baseDefinition != null) {
+                rootElement.addType().setCode(baseDefinition.getName());
+                rootElement.setBase(new ElementDefinitionDt.Base().setPath(baseDefinition.getUrl()).setMin(0).setMax("*"));
+            }
 
             // add elements
             List<XmlSchemaAttributeOrGroupRef> attributeContent;
@@ -297,9 +308,7 @@ public class XsdImporter {
                     XmlSchemaSimpleContentRestriction restrictionContent = (XmlSchemaSimpleContentRestriction)content;
 
                     StructureDefinition valueDefinition = resolveDefinition(restrictionContent.getBaseTypeName());
-                    // TODO: add element with value of type valueDefinition
-                    //ClassTypeElement valueElement = new ClassTypeElement("value", valueType, false);
-                    //elements.add(valueElement);
+                    addValueElement(valueDefinition, definition, rootPath, snapshot);
 
                     attributeContent = restrictionContent.getAttributes();
                     particleContent = null;
@@ -310,9 +319,7 @@ public class XsdImporter {
                     particleContent = null;
 
                     StructureDefinition valueDefinition = resolveDefinition(extensionContent.getBaseTypeName());
-                    // TODO: add element with value of type valueDefinition
-                    //ClassTypeElement valueElement = new ClassTypeElement("value", valueType, false);
-                    //elements.add(valueElement);
+                    addValueElement(valueDefinition, definition, rootPath, snapshot);
                 }
                 else {
                     throw new IllegalArgumentException("Unrecognized Schema Content: " + content.toString());
@@ -330,9 +337,42 @@ public class XsdImporter {
             if (particleContent != null) {
                 resolveDefinitionElements(particleContent, definition, rootPath, snapshot);
             }
+
+            if (snapshot.getElement().size() == 1) {
+                if (!options.getGenerateEmptyComplexTypes() && baseDefinition != null) {
+                    definitions.put(qualifiedTypeName, baseDefinition);
+                    return baseDefinition;
+                }
+            }
         }
 
         return definition;
+    }
+
+    private MarkdownDt buildMarkdown(String value) {
+        MarkdownDt markdown = new MarkdownDt();
+        markdown.setValue(value);
+        return markdown;
+    }
+
+    private String getShort(String documentation) {
+        int i = documentation.indexOf('.');
+        if (i >= 0) {
+            return documentation.substring(0, i);
+        }
+
+        return documentation;
+    }
+
+    private void addValueElement(StructureDefinition valueDefinition, StructureDefinition definition, String rootPath, StructureDefinition.Snapshot snapshot) {
+        ElementDefinitionDt element = snapshot.addElement();
+        element.setPath(String.format("%s.%s", rootPath, "value"));
+        element.addType().setCode(valueDefinition.getName());
+        element.setName("value");
+        element.setMin(0);
+        element.setMax("1");
+        element.setShort("Value");
+        element.setDefinition(buildMarkdown("This element contains the value for the type."));
     }
 
     private void resolveDefinitionElements(XmlSchemaParticle particle, StructureDefinition definition, String rootPath, StructureDefinition.Snapshot snapshot) {
@@ -393,19 +433,18 @@ public class XsdImporter {
         }
 
         if (elementTypeDefinition == null) {
-            // TODO: This should potentially import anonymous types as element structures, not sure we have that use case right now though....
+            // TODO: This should import anonymous types as element structures, not sure we have that use case right now though....
             return null;
         }
 
         ElementDefinitionDt elementDefinition = new ElementDefinitionDt();
 
         elementDefinition.setPath(String.format("%s.%s", rootPath, element.getName()));
-        // TODO: elementDefinition.setShort();
-        // TODO: elementDefinition.addAlias();
         elementDefinition.setName(element.getName());
-        MarkdownDt md = new MarkdownDt();
-        md.setValue(getDocumentation(element.getAnnotation()));
-        elementDefinition.setDefinition(md);
+        String documentation = getDocumentation(element.getAnnotation());
+        elementDefinition.setShort(getShort(documentation));
+        elementDefinition.setDefinition(buildMarkdown(documentation));
+        // TODO: elementDefinition.addAlias();
         elementDefinition.setMin((int) element.getMinOccurs());
         if (element.getMaxOccurs() == Long.MAX_VALUE) {
             elementDefinition.setMax("*");
@@ -438,17 +477,18 @@ public class XsdImporter {
         }
 
         if (elementTypeDefinition == null) {
-            // TODO: This should potentially import anonymous types as element structures...
+            // TODO: This should import anonymous types as element structures...
             return null;
         }
 
         ElementDefinitionDt elementDefinition = new ElementDefinitionDt();
 
         elementDefinition.setPath(String.format("%s.%s", rootPath, attribute.getName()));
-        // TODO: elementDefinition.setShort();
-        // TODO: elementDefinition.addAlias();
-        // TODO: elementDefinition.setDefinition();
         elementDefinition.setName(attribute.getName());
+        // TODO: elementDefinition.addAlias();
+        String documentation = getDocumentation(attribute.getAnnotation());
+        elementDefinition.setShort(getShort(documentation));
+        elementDefinition.setDefinition(buildMarkdown(documentation));
         switch (attribute.getUse()) {
             case NONE:
                 break;

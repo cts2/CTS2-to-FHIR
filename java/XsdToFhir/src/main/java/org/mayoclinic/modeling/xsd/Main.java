@@ -64,7 +64,7 @@ public class Main {
 
         List<StructureDefinition> fhirTypes = loadFhirTypes(fhirPath);
 
-        for (StructureDefinition sd : XsdImporter.fromSchema(schema, modelName, fhirTypes)) {
+        for (StructureDefinition sd : XsdImporter.fromSchema(schema, modelName, fhirTypes, new XsdImportOptions())) {
             File destFile = new File(dest, String.format("%s.xml", sd.getId()));
             FileWriter fw = new FileWriter(destFile);
             FhirContext ctx = FhirContext.forDstu2();
